@@ -62,3 +62,11 @@ bun test tests/
 ```
 
 Regression coverage includes certificate retry limits/cancellation, external cutover, rotation completion races, parent/child isolation, quota guards, and request/header precedence.
+
+Verified with 27 regression tests, native GitHub plugin installation and
+`omp plugin doctor`. An isolated real OMP 18.4.4 RPC session using the
+natively installed plugin automatically continued after an injected terminal
+`unknown certificate error`, receiving HTTP 200 from a local provider fixture.
+The CLI runner was also exercised against an executable fixture. These are
+local recovery/installation checks, not a claim that a real invalid certificate
+or provider quota has been repaired.
