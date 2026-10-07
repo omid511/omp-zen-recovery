@@ -1,6 +1,6 @@
 {
   "name": "omp-zen-recovery",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenCode Zen transport identity and bounded chat recovery for OMP",
   "type": "module",
   "license": "MIT",
@@ -10,6 +10,6 @@
   "omp": {
     "name": "Zen recovery",
     "description": "Fresh Zen connections, TUN cutover revival, and bounded transport/TLS retries",
-    "extensions": ["extensions/zen-spoof.ts", "extensions/bpb-rate-limit-rotate.ts"]
+    "extensions": ["extensions/zen-spoof.ts", "extensions/bpb-rate-limit-rotate.ts", "extensions/codex-reset-wakeup.ts"]
   }
 }
