@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { loadAlarm, saveAlarm, deleteAlarm, scheduleExternal, processStamp } from "../lib/codex-alarm-state.mjs";
 // Account-quota wakeups are per conversation, not per shared rotation budget.
 const BUFFER_MS = 120_000;
 const POLL_MS = 60_000;
@@ -10,7 +14,13 @@ interface AccountHealth {
 }
 interface WakeContext {
   model?: { provider: string; id: string; baseUrl?: string };
-  sessionManager: { getSessionId(): string; getBranch(): Array<{ type: string; message?: unknown }> };
+  hasUI?: boolean;
+  sessionManager: {
+    getSessionId(): string;
+    getBranch(): Array<{ type: string; id?: string; message?: unknown }>;
+    getSessionFile?(): string | undefined;
+    getLeafId?(): string | null;
+  };
   modelRegistry: { authStorage: { health: { model(provider: string, options: { modelId: string; sessionId: string; baseUrl?: string; reserveFraction: number; signal: AbortSignal }): Promise<{ accounts: AccountHealth[] }> } } };
   isIdle(): boolean;
   setTimeout(callback: () => void, ms: number): unknown;
@@ -24,6 +34,10 @@ interface WaitingChat {
   timer?: unknown;
   controller?: AbortController;
   wakeAt?: number;
+  token: string;
+  sessionFile?: string;
+  leafId?: string;
+  externalAt?: number;
 }
 function terminalQuota(messages: unknown): boolean {
   if (!Array.isArray(messages)) return false;
@@ -33,12 +47,13 @@ function terminalQuota(messages: unknown): boolean {
 }
 export default function install(pi: any) {
   let waiting: WaitingChat | undefined;
-  function cancel() {
+  function cancel(preserve = false) {
     const current = waiting;
     waiting = undefined;
     if (!current) return;
     current.ctx.clearTimer(current.timer);
     current.controller?.abort();
+    if (!preserve && current.sessionFile) deleteAlarm(current.sessionId);
   }
   function valid(current: WaitingChat) {
     return waiting === current && current.ctx.sessionManager.getSessionId() === current.sessionId && current.ctx.model?.provider === "openai-codex" && current.ctx.model.id === current.modelId;
@@ -49,10 +64,30 @@ export default function install(pi: any) {
   function schedule(current: WaitingChat, at: number) {
     if (!valid(current)) return;
     current.ctx.clearTimer(current.timer);
+    if (current.sessionFile && current.leafId) {
+      const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent");
+      const record = {
+        version: 1, token: current.token, sessionId: current.sessionId, modelId: current.modelId,
+        sessionFile: current.sessionFile, leafId: current.leafId, wakeAt: current.wakeAt, checkAt: at,
+        pid: process.pid, processStart: processStamp(process.pid)?.start,
+        paneId: current.ctx.hasUI && process.env.HERDR_ENV === "1" && process.env.OMPCODE !== "1" ? process.env.HERDR_PANE_ID : undefined,
+        socketPath: process.env.HERDR_SOCKET_PATH, frozenDir: join(agentDir, "frozen"), path: process.env.PATH,
+      };
+      saveAlarm(record);
+      if (record.paneId && current.externalAt !== at) {
+        if (scheduleExternal(record)) current.externalAt = at;
+        else notify(current, "Codex deadline saved, but external Herdr wakeup scheduling failed");
+      }
+    }
     current.timer = current.ctx.setTimeout(() => { current.timer = undefined; void inspect(current); }, Math.min(MAX_TIMER_MS, Math.max(0, at - Date.now())));
   }
   async function inspect(current: WaitingChat) {
     if (!valid(current) || current.controller) return;
+    if (process.env.OMP_SLEEP_RESUME_SESSION === current.sessionId) {
+      // sleep-state rejects input until its exact-branch restoration finishes.
+      schedule(current, Math.max(Date.now() + 1000, current.wakeAt ?? 0));
+      return;
+    }
     if (!current.ctx.isIdle()) { schedule(current, Date.now() + POLL_MS); return; }
     const controller = new AbortController();
     current.controller = controller;
@@ -107,18 +142,34 @@ export default function install(pi: any) {
     }
   }
   function arm(ctx: WakeContext, messages: unknown) {
-    cancel();
-    if (ctx.model?.provider !== "openai-codex" || !terminalQuota(messages)) return;
-    const current: WaitingChat = { ctx, sessionId: ctx.sessionManager.getSessionId(), modelId: ctx.model.id };
+    const sessionId = ctx.sessionManager.getSessionId();
+    const saved = loadAlarm(sessionId);
+    cancel(true);
+    // omp-pane restores its exact checkpoint through /omp-sleep-resume.
+    // Do not inspect a different startup tip before that navigation completes.
+    if (process.env.OMP_SLEEP_RESUME_LEAF && ctx.sessionManager.getLeafId?.() !== process.env.OMP_SLEEP_RESUME_LEAF) return;
+    if (ctx.model?.provider !== "openai-codex" || !terminalQuota(messages)) { deleteAlarm(sessionId); return; }
+    const sessionFile = ctx.sessionManager.getSessionFile?.();
+    const branch = ctx.sessionManager.getBranch();
+    const savedLeaf = saved && branch.findIndex(entry => entry.id === saved.leafId);
+    const restore = saved && saved.sessionFile === sessionFile && saved.modelId === ctx.model.id &&
+      savedLeaf >= 0 && !branch.slice(savedLeaf + 1).some(entry => entry.type === "message");
+    const current: WaitingChat = {
+      ctx, sessionId, modelId: ctx.model.id, token: randomUUID(), sessionFile,
+      leafId: restore ? saved.leafId : ctx.sessionManager.getLeafId?.() ?? undefined,
+      wakeAt: restore && typeof saved.wakeAt === "number" ? saved.wakeAt : undefined,
+    };
     waiting = current;
+    schedule(current, current.wakeAt ?? Date.now() + POLL_MS);
     void inspect(current);
   }
   pi.on("agent_end", (event: { messages?: unknown; willContinue?: boolean }, ctx: WakeContext) => {
     if (event.willContinue) { cancel(); return; }
     arm(ctx, event.messages);
   });
-  for (const event of ["agent_start", "before_agent_start", "session_shutdown", "session_branch", "model_select"]) pi.on(event, cancel);
-  for (const event of ["session_start", "session_switch"]) pi.on(event, (_event: unknown, ctx: WakeContext) => {
+  for (const event of ["agent_start", "before_agent_start", "session_branch", "model_select"]) pi.on(event, () => cancel());
+  pi.on("session_shutdown", () => cancel(true));
+  for (const event of ["session_start", "session_switch", "session_tree"]) pi.on(event, (_event: unknown, ctx: WakeContext) => {
     const messages = ctx.sessionManager.getBranch().filter(entry => entry.type === "message").map(entry => entry.message);
     arm(ctx, messages);
   });

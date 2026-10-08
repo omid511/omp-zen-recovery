@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import install from "../extensions/codex-reset-wakeup";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadAlarm } from "../lib/codex-alarm-state.mjs";
+let stateDir: string;
+let previousStateDir: string | undefined;
+let previousResume: Record<string, string | undefined>;
 type Timer = { at: number; callback: () => void };
 let now: number;
 let originalNow: typeof Date.now;
@@ -26,13 +33,15 @@ function chat(id = "parent") {
   let provider = "openai-codex";
   let extraAccounts = false;
   let selected = true;
+  let sessionFile: string | undefined;
+  let leafId = "failure";
   let deferred: Promise<{ accounts: any[] }> | undefined;
   let signal: AbortSignal | undefined;
   const notices: string[] = [];
   const ctx = {
     get model() { return { provider, id: "gpt-5.6", baseUrl: "https://chatgpt.com/backend-api/codex" }; },
     isIdle: () => idle,
-    sessionManager: { getSessionId: () => id, getBranch: () => [{ type: "message", message: error }] },
+    sessionManager: { getSessionId: () => id, getBranch: () => [{ type: "message", id: leafId, message: error }], getSessionFile: () => sessionFile, getLeafId: () => leafId },
     modelRegistry: { authStorage: { health: { async model(_provider: string, options: any) {
       expect(options.sessionId).toBe(id); expect(options.modelId).toBe("gpt-5.6");
       signal = options.signal;
@@ -46,10 +55,22 @@ function chat(id = "parent") {
   install({ on(name: string, callback: any) { handlers.set(name, callback); }, sendUserMessage(text: string) { sent.push(text); } });
   async function emit(name: string, event: unknown = {}) { handlers.get(name)?.(event, ctx); await flush(); }
   function unpin() { selected = false; }
-  return { emit, sent, notices, unpin, fail: () => emit("agent_end", { messages: [error] }), reset: (value: number) => { reset = value; }, unknown: (value: boolean) => { unknown = value; }, healthy: () => { healthy = true; }, busy: () => { idle = false; }, provider: (value: string) => { provider = value; }, extra: () => { extraAccounts = true; }, defer: (value: Promise<{ accounts: any[] }>) => { deferred = value; }, signal: () => signal };
+  return { emit, sent, notices, unpin, persistent: () => { sessionFile = join(stateDir, id + ".jsonl"); }, branch: (leaf: string) => { leafId = leaf; }, fail: () => emit("agent_end", { messages: [error] }), reset: (value: number) => { reset = value; }, unknown: (value: boolean) => { unknown = value; }, healthy: () => { healthy = true; }, busy: () => { idle = false; }, provider: (value: string) => { provider = value; }, extra: () => { extraAccounts = true; }, defer: (value: Promise<{ accounts: any[] }>) => { deferred = value; }, signal: () => signal };
 }
-beforeEach(() => { now = 1791377000000; originalNow = Date.now; Date.now = () => now; timers = new Set(); });
-afterEach(() => { Date.now = originalNow; });
+beforeEach(() => {
+  now = 1791377000000; originalNow = Date.now; Date.now = () => now; timers = new Set();
+  stateDir = mkdtempSync(join(tmpdir(), "codex-durable-test-")); previousStateDir = process.env.CODEX_WAKEUP_STATE_DIR;
+  process.env.CODEX_WAKEUP_STATE_DIR = stateDir;
+  previousResume = { OMP_SLEEP_RESUME_SESSION: process.env.OMP_SLEEP_RESUME_SESSION, OMP_SLEEP_RESUME_LEAF: process.env.OMP_SLEEP_RESUME_LEAF };
+  delete process.env.OMP_SLEEP_RESUME_SESSION; delete process.env.OMP_SLEEP_RESUME_LEAF;
+});
+afterEach(() => {
+  Date.now = originalNow; rmSync(stateDir, { recursive: true, force: true });
+  if (previousStateDir === undefined) delete process.env.CODEX_WAKEUP_STATE_DIR; else process.env.CODEX_WAKEUP_STATE_DIR = previousStateDir;
+  for (const [key, value] of Object.entries(previousResume)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+});
 
 test("every failed chat wakes once at its selected account reset plus exactly two minutes", async () => {
   const parent = chat("parent"); const child = chat("child"); parent.extra();
@@ -98,4 +119,39 @@ test("a reopened failed chat with multiple unpinned accounts wakes after the fir
 test("losing account affinity while an alarm waits does not strand the failed chat", async () => {
   const s = chat(); s.extra(); await s.fail(); s.unpin();
   await advance(420000); expect(s.sent).toEqual(["continue"]);
+});
+
+test("shutdown preserves the original reset deadline and re-entry does not add another grace period", async () => {
+  const s = chat(); s.persistent(); await s.fail();
+  const deadline = now + 420000;
+  await advance(300000); await s.emit("session_shutdown");
+  expect(loadAlarm("parent")?.wakeAt).toBe(deadline);
+  const resumed = chat(); resumed.persistent(); resumed.healthy(); await resumed.emit("session_start");
+  await advance(119999); expect(resumed.sent).toEqual([]);
+  await advance(1); expect(resumed.sent).toEqual(["continue"]);
+  expect(loadAlarm("parent")).toBeUndefined();
+});
+test("an overdue persisted alarm revives immediately on re-entry once quota is healthy", async () => {
+  const s = chat(); s.persistent(); await s.fail(); await s.emit("session_shutdown");
+  await advance(900000);
+  const resumed = chat(); resumed.persistent(); resumed.healthy(); await resumed.emit("session_start");
+  expect(resumed.sent).toEqual(["continue"]);
+});
+test("a new user turn cancels the durable alarm so restart cannot revive it", async () => {
+  const s = chat(); s.persistent(); await s.fail(); await s.emit("before_agent_start");
+  expect(loadAlarm("parent")).toBeUndefined();
+});
+test("re-entry on a different branch cannot inherit the saved deadline", async () => {
+  const s = chat(); s.persistent(); await s.fail(); await s.emit("session_shutdown"); await advance(900000);
+  const resumed = chat(); resumed.persistent(); resumed.branch("other-failure"); resumed.healthy(); await resumed.emit("session_start");
+  expect(resumed.sent).toEqual([]);
+  await advance(120000); expect(resumed.sent).toEqual(["continue"]);
+});
+
+test("an overdue alarm waits until omp-pane's exact branch restoration finishes", async () => {
+  const s = chat(); s.persistent(); await s.fail();
+  process.env.OMP_SLEEP_RESUME_SESSION = "parent";
+  await advance(420000); expect(s.sent).toEqual([]);
+  delete process.env.OMP_SLEEP_RESUME_SESSION;
+  await advance(1000); expect(s.sent).toEqual(["continue"]);
 });

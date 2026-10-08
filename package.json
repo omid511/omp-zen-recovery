@@ -1,11 +1,11 @@
 {
   "name": "omp-zen-recovery",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "OpenCode Zen transport identity and bounded chat recovery for OMP",
   "type": "module",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/omid511/omp-zen-recovery.git" },
-  "files": ["extensions", "README.md", "LICENSE"],
+  "files": ["extensions", "lib", "scripts", "README.md", "LICENSE"],
   "scripts": { "test": "bun test tests/" },
   "omp": {
     "name": "Zen recovery",
