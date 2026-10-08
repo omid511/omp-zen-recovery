@@ -62,8 +62,19 @@ export default function install(pi: any) {
         reserveFraction: 0, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
       });
       if (!valid(current)) return;
-      // Never borrow another account's reset. Single-account profiles are unambiguous.
-      const account = health.accounts.find(value => value.selected) ?? (health.accounts.length === 1 ? health.accounts[0] : undefined);
+      // Affinity is optional (e.g. after reopening a conversation). Without a
+      // pin, OMP can reselect a usable sibling; waiting for `selected` forever
+      // would strand every multi-account chat resumed in a new process.
+      let account = health.accounts.find(value => value.selected);
+      if (!account) {
+        account = health.accounts.find(value => value.state === "healthy" || value.state === "reserve");
+        if (!account) {
+          for (const candidate of health.accounts) {
+            if (candidate.state !== "depleted" || typeof candidate.resetsAt !== "number" || !Number.isFinite(candidate.resetsAt) || candidate.resetsAt <= Date.now()) continue;
+            if (!account || candidate.resetsAt < account.resetsAt!) account = candidate;
+          }
+        }
+      }
       if (!account) { schedule(current, Date.now() + POLL_MS); return; }
       if (account.state === "depleted") {
         const reset = account.resetsAt;
@@ -87,7 +98,8 @@ export default function install(pi: any) {
       if (!current.ctx.isIdle() || !valid(current)) { schedule(current, Date.now() + POLL_MS); return; }
       cancel();
       notify(current, "Codex quota reset confirmed; resuming this chat after the two-minute grace period");
-      pi.sendUserMessage("continue", { deliverAs: "followUp" });
+      // Explicit followUp only queues in an idle host; omit it to start a turn.
+      pi.sendUserMessage("continue");
     } catch {
       if (valid(current)) schedule(current, Date.now() + POLL_MS);
     } finally {

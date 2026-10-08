@@ -25,6 +25,7 @@ function chat(id = "parent") {
   let idle = true;
   let provider = "openai-codex";
   let extraAccounts = false;
+  let selected = true;
   let deferred: Promise<{ accounts: any[] }> | undefined;
   let signal: AbortSignal | undefined;
   const notices: string[] = [];
@@ -36,7 +37,7 @@ function chat(id = "parent") {
       expect(options.sessionId).toBe(id); expect(options.modelId).toBe("gpt-5.6");
       signal = options.signal;
       if (deferred) return deferred;
-      return { accounts: [{ credentialId: 1, selected: true, state: unknown ? "unknown" : healthy || now >= reset ? "healthy" : "depleted", resetsAt: reset }, ...(extraAccounts ? [{ credentialId: 2, state: "depleted", resetsAt: reset + 9999999 }] : [])] };
+      return { accounts: [{ credentialId: 1, selected, state: unknown ? "unknown" : healthy || now >= reset ? "healthy" : "depleted", resetsAt: reset }, ...(extraAccounts ? [{ credentialId: 2, state: "depleted", resetsAt: reset + 9999999 }] : [])] };
     } } } },
     setTimeout(callback: () => void, ms: number) { const timer = { at: now + ms, callback }; timers.add(timer); return timer; },
     clearTimer(timer: Timer) { timers.delete(timer); },
@@ -44,7 +45,8 @@ function chat(id = "parent") {
   };
   install({ on(name: string, callback: any) { handlers.set(name, callback); }, sendUserMessage(text: string) { sent.push(text); } });
   async function emit(name: string, event: unknown = {}) { handlers.get(name)?.(event, ctx); await flush(); }
-  return { emit, sent, notices, fail: () => emit("agent_end", { messages: [error] }), reset: (value: number) => { reset = value; }, unknown: (value: boolean) => { unknown = value; }, healthy: () => { healthy = true; }, busy: () => { idle = false; }, provider: (value: string) => { provider = value; }, extra: () => { extraAccounts = true; }, defer: (value: Promise<{ accounts: any[] }>) => { deferred = value; }, signal: () => signal };
+  function unpin() { selected = false; }
+  return { emit, sent, notices, unpin, fail: () => emit("agent_end", { messages: [error] }), reset: (value: number) => { reset = value; }, unknown: (value: boolean) => { unknown = value; }, healthy: () => { healthy = true; }, busy: () => { idle = false; }, provider: (value: string) => { provider = value; }, extra: () => { extraAccounts = true; }, defer: (value: Promise<{ accounts: any[] }>) => { deferred = value; }, signal: () => signal };
 }
 beforeEach(() => { now = 1791377000000; originalNow = Date.now; Date.now = () => now; timers = new Set(); });
 afterEach(() => { Date.now = originalNow; });
@@ -86,4 +88,14 @@ test("resumed failed chat rearms; switching to a healthy chat cancels", async ()
 });
 test("an early healthy account still waits for the armed reset grace period", async () => {
   const s = chat(); await s.fail(); s.healthy(); await advance(419999); expect(s.sent).toEqual([]); await advance(1); expect(s.sent).toEqual(["continue"]);
+});
+
+test("a reopened failed chat with multiple unpinned accounts wakes after the first available reset", async () => {
+  const s = chat(); s.extra(); s.unpin(); await s.emit("session_start");
+  await advance(419999); expect(s.sent).toEqual([]);
+  await advance(1); expect(s.sent).toEqual(["continue"]);
+});
+test("losing account affinity while an alarm waits does not strand the failed chat", async () => {
+  const s = chat(); s.extra(); await s.fail(); s.unpin();
+  await advance(420000); expect(s.sent).toEqual(["continue"]);
 });
